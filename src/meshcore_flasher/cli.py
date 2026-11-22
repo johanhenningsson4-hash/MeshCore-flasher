@@ -110,6 +110,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not args.port:
             raise FlashError("A serial port is required. Use --list-ports to find it.")
+        if sum(bool(value) for value in (args.firmware, args.binary, args.package)) > 1:
+            raise FlashError("Use only one of firmware, --binary, or --package.")
         if args.package:
             with open_firmware_package(args.package) as package:
                 expected_chip = args.chip or package.chip

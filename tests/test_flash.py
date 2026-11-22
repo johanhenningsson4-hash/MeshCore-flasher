@@ -22,6 +22,7 @@ from meshcore_flasher.flash import (
     parse_address,
     parse_binary_spec,
 )
+from meshcore_flasher.cli import images_from_args
 
 
 class FlashCommandTests(unittest.TestCase):
@@ -220,6 +221,20 @@ class DeviceDetectionTests(unittest.TestCase):
 
 
 class FirmwarePackageTests(unittest.TestCase):
+    def test_rejects_multiple_firmware_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            firmware = root / "app.bin"
+            firmware.write_bytes(b"app")
+            args = type(
+                "Args",
+                (),
+                {"firmware": firmware, "binary": None, "package": root},
+            )()
+
+            with self.assertRaisesRegex(FlashError, "Use only one"):
+                images_from_args(args)
+
     def test_loads_manifest_with_chip_and_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
