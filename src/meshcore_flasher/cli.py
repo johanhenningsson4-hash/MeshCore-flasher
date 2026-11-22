@@ -10,8 +10,10 @@ from meshcore_flasher.flash import (
     DEFAULT_BAUD_RATE,
     FlashError,
     FirmwareImage,
+    SUPPORTED_CHIPS,
     discover_ports,
     flash_firmware,
+    open_firmware_package,
     parse_binary_spec,
 )
 
@@ -25,7 +27,12 @@ def create_parser() -> argparse.ArgumentParser:
         "firmware",
         nargs="?",
         type=Path,
-        help="merged firmware binary to write at address 0x0",
+        help="merged firmware binary to write at address 0x0 and verify",
+    )
+    parser.add_argument(
+        "--package",
+        type=Path,
+        help="firmware.json, package directory, or ZIP package",
     )
     parser.add_argument(
         "-p",
@@ -51,6 +58,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="erase the entire flash before writing firmware",
     )
     parser.add_argument(
+        "--chip",
+        choices=SUPPORTED_CHIPS,
+        help="required chip family; detected device must match before flashing",
+    )
+    parser.add_argument(
         "--list-ports",
         action="store_true",
         help="list connected serial ports and exit",
@@ -73,8 +85,9 @@ def list_available_ports() -> None:
 
 
 def images_from_args(args: argparse.Namespace) -> list[FirmwareImage]:
-    if args.firmware and args.binary:
-        raise FlashError("Use either a merged firmware file or --binary, not both.")
+    selected = sum(bool(value) for value in (args.firmware, args.binary, args.package))
+    if selected > 1:
+        raise FlashError("Use only one of firmware, --binary, or --package.")
     if args.binary:
         return [parse_binary_spec(spec) for spec in args.binary]
     if args.firmware:
@@ -97,14 +110,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not args.port:
             raise FlashError("A serial port is required. Use --list-ports to find it.")
-        images = images_from_args(args)
-        flash_firmware(
-            args.port,
-            images,
-            baud_rate=args.baud,
-            erase=args.erase,
-            output=print,
-        )
+        if args.package:
+            with open_firmware_package(args.package) as package:
+                expected_chip = args.chip or package.chip
+                if args.chip and package.chip and args.chip != package.chip:
+                    raise FlashError(
+                        f"--chip {args.chip} conflicts with package chip {package.chip}."
+                    )
+                flash_firmware(
+                    args.port,
+                    package.images,
+                    baud_rate=args.baud,
+                    erase=args.erase,
+                    output=print,
+                    expected_chip=expected_chip,
+                )
+        else:
+            flash_firmware(
+                args.port,
+                images_from_args(args),
+                baud_rate=args.baud,
+                erase=args.erase,
+                output=print,
+                expected_chip=args.chip,
+            )
     except FlashError as exc:
         parser.error(str(exc))
     except KeyboardInterrupt:

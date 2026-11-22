@@ -11,8 +11,10 @@ from meshcore_flasher.flash import (
     DEFAULT_BAUD_RATE,
     FlashError,
     FirmwareImage,
+    SUPPORTED_CHIPS,
     discover_ports,
     flash_firmware,
+    open_firmware_package,
 )
 
 
@@ -27,6 +29,7 @@ class FlasherApp(ttk.Frame):
         self.firmware_var = tk.StringVar()
         self.address_var = tk.StringVar(value="0x0")
         self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD_RATE))
+        self.chip_var = tk.StringVar(value="Auto-detect")
         self.erase_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Connect a device and select firmware.")
         self._build_ui()
@@ -40,7 +43,7 @@ class FlasherApp(ttk.Frame):
         self.master.columnconfigure(0, weight=1)
         self.master.rowconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(5, weight=1)
+        self.rowconfigure(6, weight=1)
 
         ttk.Label(self, text="Serial port").grid(
             row=0, column=0, sticky="w", padx=(0, 8), pady=4
@@ -53,7 +56,7 @@ class FlasherApp(ttk.Frame):
             row=0, column=2, padx=(8, 0), pady=4
         )
 
-        ttk.Label(self, text="Firmware binary").grid(
+        ttk.Label(self, text="Firmware/package").grid(
             row=1, column=0, sticky="w", padx=(0, 8), pady=4
         )
         firmware_entry = ttk.Entry(self, textvariable=self.firmware_var)
@@ -84,14 +87,26 @@ class FlasherApp(ttk.Frame):
             width=14,
         )
         baud_combo.grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(self, text="Expected chip").grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        chip_combo = ttk.Combobox(
+            self,
+            textvariable=self.chip_var,
+            values=("Auto-detect", *SUPPORTED_CHIPS),
+            state="readonly",
+            width=14,
+        )
+        chip_combo.grid(row=4, column=1, sticky="w", pady=4)
+
         ttk.Checkbutton(
             self,
             text="Erase all flash before writing",
             variable=self.erase_var,
-        ).grid(row=3, column=1, columnspan=2, sticky="e", pady=4)
+        ).grid(row=4, column=2, sticky="e", pady=4)
 
         button_frame = ttk.Frame(self)
-        button_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=12)
+        button_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=12)
         self.flash_button = ttk.Button(
             button_frame, text="Flash firmware", command=self.start_flash
         )
@@ -105,7 +120,7 @@ class FlasherApp(ttk.Frame):
         )
 
         log_frame = ttk.LabelFrame(self, text="Device output", padding=4)
-        log_frame.grid(row=5, column=0, columnspan=3, sticky="nsew")
+        log_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log = tk.Text(log_frame, wrap="none", height=14, state="disabled")
@@ -133,8 +148,13 @@ class FlasherApp(ttk.Frame):
 
     def choose_firmware(self) -> None:
         filename = filedialog.askopenfilename(
-            title="Select MeshCore firmware",
-            filetypes=(("Firmware binaries", "*.bin"), ("All files", "*.*")),
+            title="Select MeshCore firmware or package",
+            filetypes=(
+                ("Firmware packages", "*.zip"),
+                ("Firmware manifests", "*.json"),
+                ("Firmware binaries", "*.bin"),
+                ("All files", "*.*"),
+            ),
         )
         if filename:
             self.firmware_var.set(filename)
@@ -148,14 +168,33 @@ class FlasherApp(ttk.Frame):
         try:
             from meshcore_flasher.flash import parse_address
 
-            image = FirmwareImage(
-                parse_address(self.address_var.get()),
-                Path(self.firmware_var.get()).expanduser(),
-            )
+            source = Path(self.firmware_var.get()).expanduser()
             port = self._selected_port()
             if not port:
                 raise FlashError("Select a serial port.")
             baud = int(self.baud_var.get())
+            expected_chip = (
+                None if self.chip_var.get() == "Auto-detect" else self.chip_var.get()
+            )
+            if source.suffix.casefold() in (".zip", ".json"):
+                with open_firmware_package(source) as package:
+                    if (
+                        expected_chip
+                        and package.chip
+                        and expected_chip != package.chip
+                    ):
+                        raise FlashError(
+                            f"Selected chip {expected_chip} conflicts with package "
+                            f"chip {package.chip}."
+                        )
+                    firmware_input: tuple[FirmwareImage, ...] | Path = source
+                    expected_chip = expected_chip or package.chip
+                    package_name = package.name
+            else:
+                firmware_input = (
+                    FirmwareImage(parse_address(self.address_var.get()), source),
+                )
+                package_name = source.name
         except (FlashError, ValueError) as exc:
             messagebox.showerror("Cannot flash", str(exc), parent=self)
             return
@@ -170,26 +209,50 @@ class FlasherApp(ttk.Frame):
         self.cancel_event.clear()
         self._set_busy(True)
         self._clear_log()
-        self._append_log(f"Flashing {image.path.name} to {port} at 0x{image.address:x}.")
+        self._append_log(f"Flashing {package_name} to {port}.")
         self.worker = threading.Thread(
             target=self._flash_worker,
-            args=(port, image, baud, self.erase_var.get()),
+            args=(
+                port,
+                firmware_input,
+                baud,
+                self.erase_var.get(),
+                expected_chip,
+            ),
             daemon=True,
         )
         self.worker.start()
 
     def _flash_worker(
-        self, port: str, image: FirmwareImage, baud: int, erase: bool
+        self,
+        port: str,
+        firmware_input: tuple[FirmwareImage, ...] | Path,
+        baud: int,
+        erase: bool,
+        expected_chip: str | None,
     ) -> None:
         try:
-            flash_firmware(
-                port,
-                [image],
-                baud_rate=baud,
-                erase=erase,
-                output=self.output_queue.put,
-                cancel_event=self.cancel_event,
-            )
+            if isinstance(firmware_input, Path):
+                with open_firmware_package(firmware_input) as package:
+                    flash_firmware(
+                        port,
+                        package.images,
+                        baud_rate=baud,
+                        erase=erase,
+                        output=self.output_queue.put,
+                        cancel_event=self.cancel_event,
+                        expected_chip=expected_chip,
+                    )
+            else:
+                flash_firmware(
+                    port,
+                    firmware_input,
+                    baud_rate=baud,
+                    erase=erase,
+                    output=self.output_queue.put,
+                    cancel_event=self.cancel_event,
+                    expected_chip=expected_chip,
+                )
         except FlashError as exc:
             self.output_queue.put(f"ERROR: {exc}")
             self.output_queue.put("__FLASH_FAILED__")
