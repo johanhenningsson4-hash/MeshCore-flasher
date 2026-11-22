@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 import json
+import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,7 +14,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Sequence
+from typing import Callable, Generator, Iterable, Sequence
 
 from serial.tools import list_ports
 
@@ -36,6 +39,10 @@ FIRMWARE_MANIFEST_NAMES = ("firmware.json", "manifest.json")
 OutputCallback = Callable[[str], None]
 
 
+def _discard_output(_: str) -> None:
+    return None
+
+
 class FlashError(Exception):
     """Raised when a flash configuration is invalid or flashing fails."""
 
@@ -44,12 +51,51 @@ class FlashError(Exception):
 class FirmwareImage:
     address: int
     path: Path
+    sha256: str | None = None
+    size: int | None = None
 
     def __post_init__(self) -> None:
         if self.address < 0:
             raise FlashError("Firmware addresses cannot be negative.")
         if not self.path.is_file():
             raise FlashError(f"Firmware file not found: {self.path}")
+        if self.sha256 is not None:
+            if (
+                not isinstance(self.sha256, str)
+                or not re.fullmatch(r"[0-9a-fA-F]{64}", self.sha256)
+            ):
+                raise FlashError("Firmware SHA-256 must be exactly 64 hexadecimal characters.")
+            object.__setattr__(self, "sha256", self.sha256.casefold())
+        if self.size is not None:
+            if isinstance(self.size, bool) or not isinstance(self.size, int):
+                raise FlashError("Firmware size must be an integer number of bytes.")
+            if self.size < 0:
+                raise FlashError("Firmware size cannot be negative.")
+
+    def verify_integrity(self) -> str:
+        """Verify and return this image's SHA-256 digest."""
+        actual_size = 0
+        digest = hashlib.sha256()
+        try:
+            with self.path.open("rb") as firmware:
+                while chunk := firmware.read(1024 * 1024):
+                    actual_size += len(chunk)
+                    digest.update(chunk)
+        except OSError as exc:
+            raise FlashError(f"Could not read firmware file '{self.path}': {exc}") from exc
+
+        actual_sha256 = digest.hexdigest()
+        if self.size is not None and actual_size != self.size:
+            raise FlashError(
+                f"Firmware size check failed for '{self.path}': expected "
+                f"{self.size} bytes, found {actual_size}."
+            )
+        if self.sha256 is not None and actual_sha256 != self.sha256:
+            raise FlashError(
+                f"Firmware SHA-256 check failed for '{self.path}': expected "
+                f"{self.sha256}, found {actual_sha256}."
+            )
+        return actual_sha256
 
 
 @dataclass(frozen=True)
@@ -157,6 +203,8 @@ def load_firmware_package(
             raise FlashError(f"Firmware image {index + 1} must be an object.")
         filename = raw_image.get("file")
         address = raw_image.get("address")
+        expected_sha256 = raw_image.get("sha256")
+        expected_size = raw_image.get("size")
         if not isinstance(filename, str) or not filename.strip():
             raise FlashError(f"Firmware image {index + 1} requires a 'file'.")
         if not isinstance(address, (str, int)) or isinstance(address, bool):
@@ -170,7 +218,14 @@ def load_firmware_package(
             raise FlashError(
                 f"Firmware image path escapes the package directory: {filename}"
             ) from exc
-        images.append(FirmwareImage(parse_address(str(address)), image_path))
+        image = FirmwareImage(
+            parse_address(str(address)),
+            image_path,
+            expected_sha256,
+            expected_size,
+        )
+        image.verify_integrity()
+        images.append(image)
 
     return FirmwarePackage(package_name.strip(), chip, tuple(normalize_images(images)))
 
@@ -194,7 +249,7 @@ def _safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
 
 
 @contextmanager
-def open_firmware_package(source: Path | str) -> Iterator[FirmwarePackage]:
+def open_firmware_package(source: Path | str) -> Generator[FirmwarePackage]:
     """Open a directory, JSON manifest, or safely extracted ZIP package."""
     path = Path(source).expanduser()
     if path.suffix.casefold() != ".zip":
@@ -246,6 +301,88 @@ def chip_family_from_description(description: str) -> str:
     return max(matches, key=len)
 
 
+_PROCESS_POLL_INTERVAL_SECONDS = 0.05
+_PROCESS_TERMINATE_TIMEOUT_SECONDS = 3
+_END_OF_OUTPUT = object()
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
+
+
+def _run_esptool_process(
+    command: list[str],
+    output: OutputCallback,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, list[str]]:
+    """Run esptool while polling cancellation independently of output activity."""
+    if cancel_event and cancel_event.is_set():
+        raise FlashError("Flashing cancelled.")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            bufsize=1,
+        )
+    except OSError as exc:
+        raise FlashError(f"Could not start esptool: {exc}") from exc
+
+    assert process.stdout is not None
+    output_queue: queue.Queue[str | Exception | object] = queue.Queue()
+
+    def read_output() -> None:
+        try:
+            for line in process.stdout:
+                output_queue.put(line.rstrip())
+        except Exception as exc:
+            output_queue.put(exc)
+        finally:
+            output_queue.put(_END_OF_OUTPUT)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    lines: list[str] = []
+    reader_finished = False
+    completed = False
+    try:
+        while True:
+            if cancel_event and cancel_event.is_set():
+                raise FlashError("Flashing cancelled.")
+            try:
+                item = output_queue.get(timeout=_PROCESS_POLL_INTERVAL_SECONDS)
+            except queue.Empty:
+                item = None
+            if item is _END_OF_OUTPUT:
+                reader_finished = True
+            elif isinstance(item, Exception):
+                raise FlashError(f"Could not read esptool output: {item}") from item
+            elif isinstance(item, str):
+                lines.append(item)
+                output(item)
+
+            return_code = process.poll()
+            if reader_finished and return_code is not None:
+                completed = True
+                return return_code, lines
+    finally:
+        if not completed and process.poll() is None:
+            _terminate_process(process)
+        reader.join(timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
+        process.stdout.close()
+
+
 def normalize_images(
     images: Iterable[FirmwareImage | Path | str],
 ) -> list[FirmwareImage]:
@@ -262,6 +399,38 @@ def normalize_images(
     if len(addresses) != len(set(addresses)):
         raise FlashError("Each firmware binary must have a unique flash address.")
     return sorted(normalized, key=lambda item: item.address)
+
+
+@contextmanager
+def _stage_firmware_images(
+    images: Sequence[FirmwareImage],
+    output: OutputCallback,
+) -> Generator[tuple[FirmwareImage, ...]]:
+    """Copy and validate firmware once so flashing cannot observe file changes."""
+    with tempfile.TemporaryDirectory(prefix="meshcore-flash-") as temp:
+        destination = Path(temp)
+        staged: list[FirmwareImage] = []
+        for index, image in enumerate(images):
+            staged_path = destination / f"{index}-{image.path.name}"
+            try:
+                shutil.copyfile(image.path, staged_path)
+            except OSError as exc:
+                raise FlashError(
+                    f"Could not stage firmware file '{image.path}': {exc}"
+                ) from exc
+            staged_image = FirmwareImage(
+                image.address,
+                staged_path,
+                image.sha256,
+                image.size,
+            )
+            digest = staged_image.verify_integrity()
+            staged.append(staged_image)
+            output(
+                f"Verified {image.path.name} at 0x{image.address:x} "
+                f"({staged_path.stat().st_size} bytes, SHA-256 {digest})."
+            )
+        yield tuple(staged)
 
 
 def build_esptool_command(
@@ -325,6 +494,7 @@ def detect_chip(
     *,
     baud_rate: int = DEFAULT_BAUD_RATE,
     output: OutputCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> DetectedChip:
     """Connect to the device and identify its ESP chip."""
     if not port.strip():
@@ -347,26 +517,10 @@ def detect_chip(
         "no_reset",
         "chip_id",
     ]
-    output = output or (lambda line: None)
+    output = output or _discard_output
     output("Detecting device...")
-    lines: list[str] = []
-    try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            check=False,
-        )
-    except OSError as exc:
-        raise FlashError(f"Could not start esptool: {exc}") from exc
-    for line in result.stdout.splitlines():
-        output(line)
-        lines.append(line)
-    if result.returncode != 0:
+    return_code, lines = _run_esptool_process(command, output, cancel_event)
+    if return_code != 0:
         raise FlashError(
             "Device detection failed: check the cable, selected port, and "
             "whether the device is in download mode."
@@ -395,94 +549,73 @@ def flash_firmware(
     """Flash firmware and stream esptool output to a callback."""
     images = normalize_images(images)
     if output is None:
-        output = lambda line: None
+        output = _discard_output
     expected_chip = (
         re.sub(r"[^a-z0-9]", "", expected_chip.casefold()) if expected_chip else None
     )
     if expected_chip and expected_chip not in SUPPORTED_CHIPS:
         raise FlashError(f"Unsupported expected chip family '{expected_chip}'.")
 
-    detected_chip = detect_chip(port, baud_rate=baud_rate, output=output)
-    if expected_chip and detected_chip.family != expected_chip:
-        raise FlashError(
-            f"Chip verification failed: firmware expects {expected_chip}, "
-            f"but the connected device is {detected_chip.description} "
-            f"({detected_chip.family})."
+    with _stage_firmware_images(images, output) as staged_images:
+        detected_chip = detect_chip(
+            port,
+            baud_rate=baud_rate,
+            output=output,
+            cancel_event=cancel_event,
         )
-    output(f"Verified chip family: {detected_chip.family}.")
+        if expected_chip and detected_chip.family != expected_chip:
+            raise FlashError(
+                f"Chip verification failed: firmware expects {expected_chip}, "
+                f"but the connected device is {detected_chip.description} "
+                f"({detected_chip.family})."
+            )
+        output(f"Verified chip family: {detected_chip.family}.")
 
-    operations: list[tuple[str, list[str]]] = []
-    if erase:
+        operations: list[tuple[str, list[str]]] = []
+        if erase:
+            operations.append(
+                (
+                    "Erasing flash",
+                    build_esptool_command(
+                        port,
+                        staged_images,
+                        baud_rate=baud_rate,
+                        erase=True,
+                        chip=detected_chip.family,
+                    ),
+                )
+            )
         operations.append(
             (
-                "Erasing flash",
+                "Writing firmware",
                 build_esptool_command(
                     port,
-                    images,
+                    staged_images,
                     baud_rate=baud_rate,
-                    erase=True,
+                    erase=False,
                     chip=detected_chip.family,
                 ),
             )
         )
-    operations.append(
-        (
-            "Writing firmware",
-            build_esptool_command(
-                port,
-                images,
-                baud_rate=baud_rate,
-                erase=False,
-                chip=detected_chip.family,
-            ),
-        )
-    )
-    operations.append(
-        (
-            "Verifying firmware",
-            build_esptool_command(
-                port,
-                images,
-                baud_rate=baud_rate,
-                verify=True,
-                chip=detected_chip.family,
-            ),
-        )
-    )
-
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    for label, command in operations:
-        output(f"{label}...")
-        try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-                bufsize=1,
+        operations.append(
+            (
+                "Verifying firmware",
+                build_esptool_command(
+                    port,
+                    staged_images,
+                    baud_rate=baud_rate,
+                    verify=True,
+                    chip=detected_chip.family,
+                ),
             )
-        except OSError as exc:
-            raise FlashError(f"Could not start esptool: {exc}") from exc
+        )
 
-        assert process.stdout is not None
-        try:
-            for line in process.stdout:
-                if cancel_event and cancel_event.is_set():
-                    process.terminate()
-                    process.wait()
-                    raise FlashError("Flashing cancelled.")
-                output(line.rstrip())
-            return_code = process.wait()
-        finally:
-            process.stdout.close()
-
-        if return_code != 0:
-            raise FlashError(
-                f"{label} failed: esptool exited with status {return_code}."
-            )
+        for label, command in operations:
+            output(f"{label}...")
+            return_code, _ = _run_esptool_process(command, output, cancel_event)
+            if return_code != 0:
+                raise FlashError(
+                    f"{label} failed: esptool exited with status {return_code}."
+                )
 
     output("Firmware verification completed successfully.")

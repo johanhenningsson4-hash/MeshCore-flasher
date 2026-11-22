@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 import tempfile
+import threading
 import unittest
 import json
 import zipfile
@@ -21,6 +23,7 @@ from meshcore_flasher.flash import (
     load_firmware_package,
     parse_address,
     parse_binary_spec,
+    _run_esptool_process,
 )
 from meshcore_flasher.cli import images_from_args
 
@@ -134,23 +137,29 @@ class ParsingTests(unittest.TestCase):
 
 
 class DeviceDetectionTests(unittest.TestCase):
-    @patch("meshcore_flasher.flash.subprocess.run")
-    def test_detects_chip_from_esptool_output(self, run_mock) -> None:
-        run_mock.return_value.returncode = 0
-        run_mock.return_value.stdout = (
+    @patch("meshcore_flasher.flash.subprocess.Popen")
+    def test_detects_chip_from_esptool_output(self, popen_mock) -> None:
+        process = unittest.mock.Mock()
+        process.stdout = StringIO(
             "Detecting chip type... ESP32-S3\n"
             "Chip is ESP32-S3 (revision v0.2)\n"
         )
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        popen_mock.return_value = process
 
         detected = detect_chip("COM5")
 
         self.assertEqual(detected.family, "esp32s3")
         self.assertEqual(detected.description, "ESP32-S3")
 
-    @patch("meshcore_flasher.flash.subprocess.run")
-    def test_reports_detection_failure_before_flash(self, run_mock) -> None:
-        run_mock.return_value.returncode = 2
-        run_mock.return_value.stdout = "Failed to connect\n"
+    @patch("meshcore_flasher.flash.subprocess.Popen")
+    def test_reports_detection_failure_before_flash(self, popen_mock) -> None:
+        process = unittest.mock.Mock()
+        process.stdout = StringIO("Failed to connect\n")
+        process.poll.return_value = 2
+        process.wait.return_value = 2
+        popen_mock.return_value = process
 
         with self.assertRaisesRegex(FlashError, "Device detection failed"):
             detect_chip("COM5")
@@ -185,9 +194,11 @@ class DeviceDetectionTests(unittest.TestCase):
             detect_mock.return_value = DetectedChip("esp32s3", "ESP32-S3")
             write_process = unittest.mock.Mock()
             write_process.stdout = StringIO("write ok\n")
+            write_process.poll.return_value = 0
             write_process.wait.return_value = 0
             verify_process = unittest.mock.Mock()
             verify_process.stdout = StringIO("verification ok\n")
+            verify_process.poll.return_value = 0
             verify_process.wait.return_value = 0
             popen_mock.side_effect = [write_process, verify_process]
 
@@ -210,17 +221,130 @@ class DeviceDetectionTests(unittest.TestCase):
             detect_mock.return_value = DetectedChip("esp32s3", "ESP32-S3")
             write_process = unittest.mock.Mock()
             write_process.stdout = StringIO("write ok\n")
+            write_process.poll.return_value = 0
             write_process.wait.return_value = 0
             verify_process = unittest.mock.Mock()
             verify_process.stdout = StringIO("mismatch\n")
+            verify_process.poll.return_value = 1
             verify_process.wait.return_value = 1
             popen_mock.side_effect = [write_process, verify_process]
 
             with self.assertRaisesRegex(FlashError, "Verifying firmware failed"):
                 flash_firmware("COM5", [FirmwareImage(0, firmware)])
 
+    @patch("meshcore_flasher.flash.subprocess.Popen")
+    def test_cancel_terminates_process_without_output(self, popen_mock) -> None:
+        class SilentStream:
+            def __init__(self) -> None:
+                self._released = threading.Event()
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                self._released.wait(5)
+                raise StopIteration
+
+            def close(self) -> None:
+                self.closed = True
+                self._released.set()
+
+        class SilentProcess:
+            def __init__(self) -> None:
+                self.stdout = SilentStream()
+                self.return_code: int | None = None
+                self.terminated = False
+                self.waited = False
+
+            def poll(self) -> int | None:
+                return self.return_code
+
+            def terminate(self) -> None:
+                self.terminated = True
+                self.return_code = -1
+                self.stdout._released.set()
+
+            def kill(self) -> None:
+                self.return_code = -9
+                self.stdout._released.set()
+
+            def wait(self, timeout: int | None = None) -> int:
+                self.waited = True
+                return self.return_code if self.return_code is not None else 0
+
+        process = SilentProcess()
+        popen_mock.return_value = process
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.1, cancel_event.set)
+        timer.start()
+        try:
+            with self.assertRaisesRegex(FlashError, "Flashing cancelled"):
+                _run_esptool_process(["esptool"], lambda _line: None, cancel_event)
+        finally:
+            timer.cancel()
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+        self.assertTrue(process.stdout.closed)
+
 
 class FirmwarePackageTests(unittest.TestCase):
+    def _write_manifest(
+        self, root: Path, image: dict[str, object]
+    ) -> None:
+        (root / "firmware.json").write_text(
+            json.dumps({"images": [image]}),
+            encoding="utf-8",
+        )
+
+    def test_accepts_matching_size_and_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = b"verified firmware"
+            (root / "app.bin").write_bytes(content)
+            self._write_manifest(
+                root,
+                {
+                    "address": "0x0",
+                    "file": "app.bin",
+                    "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                },
+            )
+
+            package = load_firmware_package(root)
+
+            self.assertEqual(package.images[0].size, len(content))
+
+    def test_rejects_sha256_mismatch_before_flashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.bin").write_bytes(b"firmware")
+            self._write_manifest(
+                root,
+                {
+                    "address": "0x0",
+                    "file": "app.bin",
+                    "sha256": "0" * 64,
+                },
+            )
+
+            with self.assertRaisesRegex(FlashError, "SHA-256 check failed"):
+                load_firmware_package(root)
+
+    def test_rejects_size_mismatch_before_flashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.bin").write_bytes(b"firmware")
+            self._write_manifest(
+                root,
+                {"address": "0x0", "file": "app.bin", "size": 1},
+            )
+
+            with self.assertRaisesRegex(FlashError, "size check failed"):
+                load_firmware_package(root)
+
     def test_rejects_multiple_firmware_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

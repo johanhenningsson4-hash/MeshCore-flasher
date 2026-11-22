@@ -34,6 +34,7 @@ class FlasherApp(ttk.Frame):
         self.status_var = tk.StringVar(value="Connect a device and select firmware.")
         self._build_ui()
         self.refresh_ports()
+        self.master.protocol("WM_DELETE_WINDOW", self.close)
         self.after(100, self._drain_output)
         self.grid(row=0, column=0, sticky="nsew")
 
@@ -266,6 +267,15 @@ class FlasherApp(ttk.Frame):
         if self.worker and self.worker.is_alive():
             self.cancel_event.set()
             self.status_var.set("Cancelling…")
+
+    def close(self) -> None:
+        if self.worker and self.worker.is_alive():
+            self.cancel_event.set()
+            self.status_var.set("Cancelling before exit…")
+            self.worker.join(timeout=5)
+            if self.worker.is_alive():
+                return
+        self.master.destroy()
 
     def _set_busy(self, busy: bool) -> None:
         self.flash_button.configure(state="disabled" if busy else "normal")

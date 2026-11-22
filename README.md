@@ -77,7 +77,12 @@ They can be passed directly, placed in a directory, or packaged into a ZIP:
   "name": "MeshCore Companion 1.4.0",
   "chip": "esp32s3",
   "images": [
-    {"address": "0x0", "file": "bootloader.bin"},
+    {
+      "address": "0x0",
+      "file": "bootloader.bin",
+      "size": 17952,
+      "sha256": "<64 hexadecimal characters>"
+    },
     {"address": "0x8000", "file": "partitions.bin"},
     {"address": "0x10000", "file": "firmware.bin"}
   ]
@@ -86,6 +91,10 @@ They can be passed directly, placed in a directory, or packaged into a ZIP:
 
 The package's chip declaration is checked against the connected device before
 erasing or writing. Binary paths must remain inside the package directory.
+The optional `size` and `sha256` fields are validated before device detection.
+For all inputs, the application copies and verifies a snapshot before connecting,
+so later file changes cannot alter the bytes used by the flash and verification
+steps.
 
 Use `meshcore-flash --list-ports` to find connected serial devices. The first
 connected matching device is not selected automatically, so always verify the
