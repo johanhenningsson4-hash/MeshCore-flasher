@@ -1,12 +1,16 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshcore-flasher"
 version = "0.1.0"
 description = "Desktop and command-line flasher for MeshCore devices"
+authors = [
+  {name = "Johan Henningsson"},
+]
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
   "esptool>=4.7,<5",

@@ -126,3 +126,7 @@ passes.
   firmware or device information anywhere.
 - Only ESP32-based MeshCore devices are currently supported. Other targets
   (for example, UF2-based boards) require their vendor-specific flashing tool.
+
+## License
+
+This project is distributed under the MIT License. See [LICENSE](LICENSE).
